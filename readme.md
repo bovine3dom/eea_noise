@@ -1,20 +1,13 @@
 # EEA noise
 
-Create an EEA noise map at H3 resolution 8. Use Kontur population data
-in ClickHouse to calculate population-weighted medians at resolution 4.
+Aggregate EEA noise data to h3 res 6 using Kontur population data
 
 ## Data source
 
 [Noise contours data reported under Environmental Noise Directive (END) 2022
 (vector), Mar. 2026](https://sdi.eea.europa.eu/data/853e72e4-4642-47d1-8556-2cc231bd43e0).
 
-The GeoPackages use EPSG:3035. Select only layers that end in `_Lden`.
-The importer checks the GeoPackage. It repairs geometries with
-`ogr2ogr -makevalid` and transforms coordinates to EPSG:4326. Null geometries
-do not contribute. The Rust helper uses `--polygon-only`: lines, points,
-and empty polygon components have no area and do not contribute. Polygon
-components in geometry collections are retained. The source GeoPackage is
-not changed.
+The GeoPackages use EPSG:3035.
 
 ## Method
 
@@ -36,38 +29,17 @@ not changed.
    ```
 
 Use all 49 children in the denominator, or 41 for pentagon parents. Fine
-cells without contours contribute zero energy. Do not divide only by the
-number of samples with reported noise. Cells with no contribution are
-omitted. Do not average dB values or take their geometric mean.
-
-This is equal-weight sampling through the
-[H3 logical hierarchy](https://h3geo.org/docs/highlights/indexing/), not exact
-polygon-area weighting. Fine cells do not exactly tile the parent boundary.
-The output has no band or quality-flag columns.
-
-For noise addition, see the
-[CCOHS guidance](https://www.ccohs.ca/oshanswers/phys_agents/noise_basic.html).
+cells without contours contribute zero energy.
 
 ## Output
 
-The combined output is `data/h3/EEA-r10-to-r8.arrow`. It is published only
-after all 24 countries and the final H3-MON check succeed.
-
-The existing country files are:
-
-- `data/h3/CY-r10-to-r8.arrow`: Cyprus, 840 rows.
-- `data/h3/AT-r10-to-r8.arrow`: Austria, 12,899 rows.
+The combined output is `data/h3/EEA-r10-to-r8.arrow`.
 
 | Column | Type | Content |
 | --- | --- | --- |
 | `index_upper` | UInt32 | Upper 32 bits of the H3 index |
 | `index_lower` | UInt32 | Lower 32 bits of the H3 index |
 | `value` | Float32 | Energy-mean combined Lden estimate in dB |
-
-All noise conversion cells have resolution 8. There are no additional columns or
-dictionary encoding. `data/h3/CY-center.arrow` is the earlier single-centre
-estimate. The files in `data/h3/CY/` are earlier maximum-overlap results.
-Keep these files for comparison.
 
 ## Run
 
@@ -104,37 +76,20 @@ concatenate or average country-level dB values. This prevents duplicate
 reports at borders from adding energy twice.
 
 Caches have one record batch per H3 base cell. The merger processes one
-base cell at a time to limit memory use. These caches are internal files,
-not H3-MON input. The combined output has only the three columns above and
-uses no compression.
+base cell at a time to limit memory use.
 
 Progress is saved in `data/h3/eea-work/state.json`. Country logs and caches
 are in `data/h3/eea-work/countries/`. Repeat the command to resume an
 interrupted run. Completed caches are reused if the input files have not
 changed. Do not start another main runner with the same work directory.
 
-The GDAL and Rust stages are mostly single-threaded. More Julia threads
-do not make these stages run in parallel. To use free CPU cores during a
-run, start five extra country workers for eight CPU cores:
+To use free CPU cores during a run, start extra workers:
 
 ```bash
 python3 assist_dataset.py \
   data/eea_v_3035_1_k_noise-contours-end2022_p_2026_v01_r00 \
   --work-dir data/h3/eea-work --jobs 5
 ```
-
-If you omit `--jobs`, the worker count is the available CPU count minus
-that of the main runner. CPU use can fall when few countries remain.
-
-The extra workers select pending countries, with small inputs first.
-They check available memory against estimates from geometry sizes and
-keep a 16 GiB reserve in that calculation. This is not a hard memory
-limit. Countries that do not fit remain with the main runner. Logs are
-in `data/h3/eea-work/helpers/`.
-
-Country locks prevent duplicate work. Cache metadata identifies the
-input and calculation method. The main runner reuses these caches when
-it reaches the corresponding countries. Existing jobs are not restarted.
 
 ```bash
 jaq '.status, (.countries | map(.status) | group_by(.) | map({status: .[0], count: length}))' \
@@ -146,69 +101,8 @@ source files and previous Arrow outputs are not changed.
 
 ## Population-weighted median
 
-Run `aggregate_population.sql` on the ClickHouse server that has
-`public_kontur_population_20231101`. Use your usual connection options:
-
-```bash
-clickhouse-client --queries-file aggregate_population.sql
-```
-
-The query reads `chungus/scratch/EEA-r10-to-r8.arrow` and writes
-`chungus/scratch/EEA-population-median-r4.arrow`. Both paths are relative
-to the server's `user_files` directory. The output file must not exist.
-
-The population table must have resolution-8 `h3` indexes and integer
-`population` counts. Only positive population counts contribute. The
-query uses `quantileExactWeighted(0.5)` to calculate the median in dB.
-It does not average energy or expand each resident into a separate row.
-
-The output includes only resolution-4 parents represented in the noise
-file. Within each parent, all populated children contribute, including
-children without noise data. Those children are assigned 0 dB. This is
-a missing-value rule, not measured silence or zero acoustic energy.
-Parents without population are omitted. The query does not create zero
-values for the rest of the world.
-
-The output has `index_upper UInt32`, `index_lower UInt32`, and
-`value Float32`, with no compression. To check it with the H3-MON reader:
-
-```bash
-node test_h3mon.mjs /path/to/EEA-population-median-r4.arrow 4
-```
-
-## Scaling check
-
-These measurements used the earlier batched JSON path, before direct
-GDAL-to-Rust streaming. The input files were in the file-system cache.
-Each run used eight Julia threads. Memory is resident set size (RSS), summed across the process tree.
-
-| Country | Input Lden features | Elapsed time | Peak sampled tree RSS | Output size |
-| --- | ---: | ---: | ---: | ---: |
-| Cyprus | 155 | 74 s | 1.88 GiB | 10,850 bytes |
-| Austria | 629,049 | 271 s | 2.56 GiB | 155,570 bytes |
-
-The Austria road layer took 212 s to sample and convert. The railway
-layer took 36 s. These two large layers processed about 4.5 MB of source
-geometry per second. Their run times were roughly proportional to geometry
-size. Do not estimate run time from country area alone.
-
-The original per-feature process design was stopped during rail conversion
-after 364 s. This was not a complete baseline run. Batched processing
-produced a Cyprus file identical, byte for byte, to the previous output.
-
-Results and per-layer timings are in `data/h3/AT-benchmark.json`,
-`data/h3/CY-benchmark.json`, and their `.log` files. Memory was sampled
-every 0.25 s. Shared pages can be counted more than once. Elapsed time
-includes Julia startup.
-
-The benchmark wrapper requires Python and `psutil`. Use new output paths
-when you repeat a run:
-
-```bash
-python3 benchmark_country.py data/h3/AT-rerun-benchmark.json \
-  julia +1.10 --project=../geojson2h3 --threads=8 convert_country.jl \
-  data/eea_v_3035_1_k_noise-contours-end2022_p_2026_v01_r00/AT.gpkg data/h3/AT-rerun.arrow
-```
+Run `aggregate_population.sql` on a ClickHouse server that has
+`public_kontur_population_20231101`. 
 
 ## Tests
 
@@ -218,12 +112,3 @@ julia +1.10 --project=../geojson2h3 test_dataset.jl
 python3 test_aggregate_population.py
 node test_h3mon.mjs data/h3/EEA-r10-to-r8.arrow
 ```
-
-Importer tests cover energy averaging, complete child counts, pentagons,
-duplicate reports, and producer failure. The population test requires
-`clickhouse local`. It checks missing-value weights, output extent,
-zero-population cells, Arrow types, and output preservation.
-
-The decoder test uses the installed dependencies in `~/projects/H3-MON`.
-It checks the Arrow schema, index types, H3 resolution, and numeric values.
-The H3-MON Arrow reader rejects record-batch compression.
