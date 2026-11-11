@@ -1,7 +1,7 @@
 # EEA noise
 
-Create an EU-wide map of population-weighted noise at H3 resolution 8.
-Join Kontur population data in ClickHouse next.
+Create an EEA noise map at H3 resolution 8. Use Kontur population data
+in ClickHouse to calculate population-weighted medians at resolution 4.
 
 ## Data source
 
@@ -64,7 +64,7 @@ The existing country files are:
 | `index_lower` | UInt32 | Lower 32 bits of the H3 index |
 | `value` | Float32 | Energy-mean combined Lden estimate in dB |
 
-All output cells have resolution 8. There are no additional columns or
+All noise conversion cells have resolution 8. There are no additional columns or
 dictionary encoding. `data/h3/CY-center.arrow` is the earlier single-centre
 estimate. The files in `data/h3/CY/` are earlier maximum-overlap results.
 Keep these files for comparison.
@@ -144,6 +144,38 @@ jaq '.status, (.countries | map(.status) | group_by(.) | map({status: .[0], coun
 A failed country prevents publication of the combined output. Existing
 source files and previous Arrow outputs are not changed.
 
+## Population-weighted median
+
+Run `aggregate_population.sql` on the ClickHouse server that has
+`public_kontur_population_20231101`. Use your usual connection options:
+
+```bash
+clickhouse-client --queries-file aggregate_population.sql
+```
+
+The query reads `chungus/scratch/EEA-r10-to-r8.arrow` and writes
+`chungus/scratch/EEA-population-median-r4.arrow`. Both paths are relative
+to the server's `user_files` directory. The output file must not exist.
+
+The population table must have resolution-8 `h3` indexes and integer
+`population` counts. Only positive population counts contribute. The
+query uses `quantileExactWeighted(0.5)` to calculate the median in dB.
+It does not average energy or expand each resident into a separate row.
+
+The output includes only resolution-4 parents represented in the noise
+file. Within each parent, all populated children contribute, including
+children without noise data. Those children are assigned 0 dB. This is
+a missing-value rule, not measured silence or zero acoustic energy.
+Parents without population are omitted. The query does not create zero
+values for the rest of the world.
+
+The output has `index_upper UInt32`, `index_lower UInt32`, and
+`value Float32`, with no compression. To check it with the H3-MON reader:
+
+```bash
+node test_h3mon.mjs /path/to/EEA-population-median-r4.arrow 4
+```
+
 ## Scaling check
 
 These measurements used the earlier batched JSON path, before direct
@@ -183,11 +215,14 @@ python3 benchmark_country.py data/h3/AT-rerun-benchmark.json \
 ```bash
 julia +1.10 --project=../geojson2h3 --threads=8 test_country.jl
 julia +1.10 --project=../geojson2h3 test_dataset.jl
+python3 test_aggregate_population.py
 node test_h3mon.mjs data/h3/EEA-r10-to-r8.arrow
 ```
 
 Importer tests cover energy averaging, complete child counts, pentagons,
-duplicate reports, and producer failure.
+duplicate reports, and producer failure. The population test requires
+`clickhouse local`. It checks missing-value weights, output extent,
+zero-population cells, Arrow types, and output preservation.
 
 The decoder test uses the installed dependencies in `~/projects/H3-MON`.
 It checks the Arrow schema, index types, H3 resolution, and numeric values.
